@@ -182,7 +182,7 @@ runs:
 
     - name: Install just
       if: contains(fromJSON(inputs.install-tools), 'just')
-      uses: taiki-e/install-action@0aad1e145276e872773365c6f6827f542c1c5614 # just
+      uses: taiki-e/install-action@c516d3ca393e0ff6b84adeb1ffdf94e2bf989b42 # just
       with:
         tool: just
 
