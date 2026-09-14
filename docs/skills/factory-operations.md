@@ -1,8 +1,10 @@
 ---
 name: factory-operations
-description: Production gate (2-human approval), promotion cadence and merge-queue contract, factory health monitor, and Renovate auto-merge.
+description: Production gate (2-human approval), promotion cadence and merge-queue contract, factory health monitor, and Renovate auto-merge. Use when configuring or verifying the 2-human production environment gate, managing promotion cadence and merge queues across image repos, troubleshooting factory pipeline health monitoring, or verifying Renovate auto-merge configuration.
 metadata:
   type: reference
+  context7-sources:
+    - /renovatebot/renovate
 ---
 
 # Factory Operations Skill
@@ -159,6 +161,11 @@ Use the workflow `github.token` for read-only `gh run list` calls against the pu
 Generate a GitHub App token scoped to `projectbluefin/common` before creating issues there. This keeps
 cross-repo issue writes explicit while avoiding broader write scopes for routine monitoring.
 
+Token generation is best-effort so a GitHub App installation permission mismatch cannot prevent the
+health checks from running. If the cross-repo token is unavailable, use the workflow's repository-scoped
+`github.token` to file alerts in `projectbluefin/actions`. This preserves monitoring and alerting while
+keeping the fallback credential unable to write outside its source repository.
+
 **`MERGERAPTOR_APP_ID` is a `secrets.*` value, not a `vars.*` value** — see the approved-secrets
 table in `docs/skills/supply-chain.md`. Passing `vars.MERGERAPTOR_APP_ID` to
 `actions/create-github-app-token` silently resolves to an empty string (repo/org variables and
@@ -271,6 +278,10 @@ gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state --jq .state
 
 The repository has `allow_auto_merge: true` enabled. Without this, GitHub ignores the `automerge` setting regardless of config.
 
+### Automated wiring assertion
+
+`.github/workflows/renovate-automerge-wiring.yml` runs `scripts/renovate-automerge-wiring-check.sh` on a daily schedule (and via `workflow_dispatch`). It asserts the declarative facts that make a real mergeraptor PR mergeable — `allow_auto_merge` is true, and the MergeRaptor app is the **sole** review-bypass actor on `main` — and reports any live mergeraptor/renovate PR with auto-merge enabled. The end-to-end merge itself needs a real mergeraptor PR (created out-of-band by Renovate) and cannot be forced from CI, so this check is the part of issue #403 that is automatable: it fails loudly if the wiring drifts, and its passing is the precondition evidence that the merge step in `renovate-automerge.yml` can land a qualifying PR. Covered by `tests/bats/test_renovate_automerge_wiring_check.bats`.
+
 ### Relationship to `@v1`
 
 Renovate keeps SHA pins current **for third-party actions in this repo**. Consumers don’t see the updates until a maintainer advances the `@v1` tag. See the `@v1` runbook in AGENTS.md for the exact commands.
@@ -288,6 +299,27 @@ Renovate keeps SHA pins current **for third-party actions in this repo**. Consum
 | Two Renovate PRs update the same action | Both opened before either merged | Close the older/lower version one; merge the newer |
 | Dependency Dashboard (issue #42) shows PRs as "Open" | Renovate dashboard is eventually consistent - PRs may already be merged | Confirm with `gh pr view NNN --json mergedAt` before acting; the dashboard self-corrects on next Renovate run |
 | Renovate warns: "Fallback to renovate.json as preset is deprecated" | Config file named `renovate.json` instead of `default.json` | Rename: `git mv renovate.json default.json` - content stays identical |
+
+### Verification — is auto-merge actually wired up?
+
+The bypass allowance and the workflow are independent halves. Configuring only one
+leaves the system inert but looking correct. Check all five:
+
+- [ ] `.github/workflows/renovate-automerge.yml` exists in **this** repo and its
+      `workflow_run.workflows:` list names every CI workflow that gates `main`.
+- [ ] The branch-protection bypass lists app `mergeraptor` and nothing else
+      (command at the top of this section).
+- [ ] `MERGERAPTOR_APP_ID` and `MERGERAPTOR_PRIVATE_KEY` are set as repo secrets —
+      without them the job runs as `github-actions[bot]`, which has no bypass and
+      cannot merge.
+- [ ] `gh api repos/projectbluefin/actions --jq .allow_auto_merge` returns `true`.
+- [ ] A recent run of the "Renovate Auto-merge" workflow exists and its log ends in
+      either a merge or an explicit skip reason — a workflow that never triggers is
+      the failure mode this checklist exists to catch:
+      ```bash
+      gh run list --repo projectbluefin/actions --workflow renovate-automerge.yml --limit 5
+      ```
+
 
 ---
 
@@ -406,6 +438,49 @@ REMOTE_TREE=$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1 | xargs git ca
 [ "$SQUASH_TREE" = "$REMOTE_TREE" ] && echo "no-op, skipping force-push"
 ```
 
+### Queue-entry guard: avoid branch rewrites when PR is merge-queued
+
+When a promotion PR is enrolled in a merge queue, GitHub locks the head branch and rejects
+any force-push or branch mutation with `GH006: Ref cannot be updated: A pull request using this branch as its head is in the merge queue and cannot be modified.` Subsequent workflow runs (e.g. daily cron, push to testing, or PR review triggers) must not attempt to rebuild or mutate the branch while it is queued.
+
+Before checkout or branch mutation, query GraphQL for an existing `mergeQueueEntry` on the
+open promotion PR. If a queue entry exists, emit an informative notice, set `promoted=false`,
+and exit 0 so the merge queue can progress undisturbed:
+
+```bash
+# shellcheck disable=SC2016  # GraphQL variables, not shell variables
+PR_DATA=$(gh api graphql \
+  -f query='query($owner: String!, $repo: String!, $head: String!, $base: String!) {
+    repository(owner: $owner, name: $repo) {
+      pullRequests(headRefName: $head, baseRefName: $base, states: OPEN, first: 1) {
+        nodes {
+          id
+          number
+          url
+          mergeQueueEntry {
+            id
+            state
+          }
+        }
+      }
+    }
+  }' \
+  -F owner="$REPO_OWNER" \
+  -F repo="$REPO_NAME" \
+  -F head="$PROMOTION_BRANCH" \
+  -F base="$TARGET_BRANCH" \
+  --jq '.data.repository.pullRequests.nodes[0] // empty' 2>/dev/null) || PR_DATA=""
+
+if [ -n "$PR_DATA" ]; then
+  QUEUE_ENTRY_ID=$(echo "$PR_DATA" | jq -r '.mergeQueueEntry.id // empty' 2>/dev/null || echo "")
+  if [ -n "$QUEUE_ENTRY_ID" ]; then
+    echo "::notice::Promotion PR #${PR_NUMBER} has active merge queue entry (${QUEUE_ENTRY_ID}) — skipping branch mutation"
+    echo "promoted=false" >> "$GITHUB_OUTPUT"
+    exit 0
+  fi
+fi
+```
+
 ### gh api failure output goes to stdout — capture defensively
 
 `gh api` on a failed request (HTTP 404/500) prints the API error body to **stdout**
@@ -494,3 +569,54 @@ Renovate keeps pins fresh automatically; the factory health monitor surfaces fai
 |---|---|---|
 | Environment gate never appears | `production` Environment not configured in GitHub UI | Follow the Manual GitHub UI setup steps above |
 | Both reviewers approved but job didn't start | GitHub Environments cache can take ~30s to register approvals | Wait 30s and refresh the Actions run page |
+
+---
+
+## When to Use
+
+Use this skill when:
+- Setting up or auditing the machine-enforced 2-human production approval gate in consumer repositories.
+- Modifying promotion schedules, cadence, or merge-queue integration across bluefin, dakota, or bluefin-lts.
+- Investigating factory health monitoring alerts or failure issue generation in `projectbluefin/common`.
+- Debugging or configuring Renovate dependency updates and automated merge rules for first-party or third-party pins.
+- Verifying the end-to-end promotion PR format (Design C) and checklist markers.
+
+## When NOT to Use
+
+Do not use this skill to:
+- Modify individual composite action implementations (use `composite-actions.md`).
+- Bypass the 2-human approval gate or force promotions directly to stable without verification.
+- Manually edit generated promotion PRs while automation is active.
+
+## Core Process
+
+1. **Production gate enforcement**: Configure GitHub Environment `production` with 2 required maintainer reviewers; ensure promotional workflows declare `environment: production`.
+2. **Promotion workflow orchestration**: Validate that weekly promotions lock the main HEAD SHA, execute full e2e testsuites, and post structured Design C promotion PRs.
+3. **Merge-queue compliance**: Follow the merge-queue contract (`use_merge_queue`), ensuring queue entry guards prevent out-of-order race conditions.
+4. **Health monitoring**: Maintain the 6-hour scheduled health check; confirm automated alerts fire when pipeline success rates drop below 80%.
+5. **Renovate automation**: Configure Renovate presets and package rules; ensure first-party references are ignored and third-party SHA bumps auto-merge upon passing CI.
+
+## Common Rationalizations
+
+| Rationalization | Reality |
+|---|---|
+| "Only one maintainer is available, so bypass the environment gate." | The 2-human rule is an intentional safety invariant preventing single-point compromise or accidental releases. |
+| "Promotion can skip e2e tests because testing passed yesterday." | Builds drift constantly with upstream packages; promotional gates require explicit e2e verification of the exact SHA. |
+| "A single failing run isn't worth investigating." | Repeated silent failures degrade pipeline health until mass breakages occur. |
+| "Renovate auto-merge doesn't need verification if actionlint passed." | Auto-merge can fail silently if GitHub App credentials or branch protection rules are misconfigured. |
+
+## Red Flags
+
+- Production promotion jobs executing without an `environment: production` block.
+- Self-approval or single-human approvals pushing images to the `:stable` tag.
+- Disabling `run_e2e` or promotion gates without explicit maintainer sign-off.
+- Renovate creating duplicate PRs to pin first-party `projectbluefin/actions` references.
+- Missing `MERGERAPTOR_APP_ID` or private keys leading to silent auto-merge workflow failures.
+
+## Verification
+
+- [ ] GitHub Environment `production` is configured with 2 required maintainer reviewers.
+- [ ] Weekly promotion workflows specify `environment: production`.
+- [ ] Merge queue configuration matches each repository's promotion contract (`use_merge_queue`).
+- [ ] Factory health monitor scheduled runs complete and create alert issues when failure thresholds are crossed.
+- [ ] Renovate auto-merge workflow runs with valid GitHub App authentication and branch protection bypasses.
