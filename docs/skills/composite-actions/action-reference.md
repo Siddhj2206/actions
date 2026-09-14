@@ -1,6 +1,6 @@
 ---
 name: composite-actions-reference
-description: Full action-by-action reference for all bootc-build composite actions: setup-runner, dnf-cache, preflight, push-image, sign-and-publish, chunka, ghcr-cleanup, detect-changes, validate-pr, scan-image, generate-release-notes, create-release, validate-pr-title, generate-tags, create-manifest. Load when implementing, debugging, or wiring a specific action.
+description: Full action-by-action reference for all bootc-build composite actions. Use when implementing, configuring, or debugging any specific action in bootc-build/ (setup-runner, dnf-cache, preflight, push-image, sign-and-publish, chunka, ghcr-cleanup, detect-changes, validate-pr, scan-image, generate-release-notes, create-release, validate-pr-title, generate-tags, create-manifest). Covers inputs, outputs, environment requirements, quirks, and integration examples.
 metadata:
   type: reference
 ---
@@ -186,6 +186,10 @@ rather than with podman/bootc policy.
 
 **SBOM flow** (when `generate-sbom: true`): Syft generates SPDX JSON → `actions/attest` with `sbom-path` creates a GitHub-native SBOM attestation in the attestation store → ORAS attaches the same SPDX JSON as an OCI referrer artifact → cosign signs the ORAS artifact digest. Both are needed: ORAS serves OCI-native consumers; the GitHub attestation store serves `gh attestation verify` and GitHub-native consumers.
 
+**GitHub Attestation 16MB limit guard:** GitHub Attestations (`actions/attest`) enforces a hard 16MB (16,777,216 bytes) size limit on predicate/SBOM files. For large bootc images (e.g. `bluefin-lts` on CentOS Stream 10 or Fedora), package-to-file relationships produce 100k+ edges that push the SBOM to 35-50MB. `sign-and-publish` mitigates this on two levels:
+1. `SYFT_RELATIONSHIPS_PACKAGE_FILE_OWNERSHIP="false"` is set during SBOM generation, keeping all packages, versions, and licenses while dropping redundant file-ownership edges (~85% size reduction, bringing large OS images well under 16MB).
+2. The action checks the generated SBOM file size before calling `actions/attest`. If the file exceeds 16MB, it outputs `attestable=false` with a warning and skips `actions/attest` (which also has `continue-on-error: true`), ensuring that ORAS attach, Cosign signing, and SLSA provenance attestation proceed uninterrupted rather than failing the build.
+
 **SLSA Build L2 provenance:** `actions/attest-build-provenance` (when `push-attestation: true`) emits the `https://slsa.dev/provenance/v1` predicate automatically from the OIDC token — capturing workflow ref, git SHA, trigger event, and runner environment. This satisfies SLSA Build L2 on GitHub-hosted runners. Self-hosted runners are **explicitly out of scope** — see `docs/skills/supply-chain.md`.
 
 **Cosign verify scoping:** After the keyless image sign step, `cosign verify` runs immediately with `--certificate-identity-regexp` sourced from the `certificate-identity-regexp` input (default: `projectbluefin/(bluefin|bluefin-lts|aurora|actions)`). This is scoped to specific repos rather than the entire org to prevent a compromised org repo from passing verification. Callers outside the org must override the input with their own prefix.
@@ -248,7 +252,7 @@ incompatible with the composite action's current interface. See projectbluefin/d
 Key design decisions:
 - `CHUNKAH_VERSION`, `CHUNKAH_SHA`, and `bootc-build/chunka/Containerfile.splitter` are all version-pinned. **Bump all three together** when upgrading — see `docs/skills/supply-chain.md` for the step-by-step procedure.
 - `Containerfile.splitter` is vendored at `bootc-build/chunka/Containerfile.splitter` and referenced by local path (`${{ github.action_path }}/Containerfile.splitter`). It is **never fetched from the network at build time** — fetching from a mutable release URL is a supply-chain attack vector.
-- `CHUNKAH_CONFIG_STR=$(sudo podman inspect "${SOURCE}")` passes existing OCI labels through so `containers.bootc=1` and other metadata are preserved.
+- Existing OCI labels (`containers.bootc=1`, etc.) are passed to chunkah as a JSON file rather than on argv, to avoid E2BIG on large base images. The file is created with `sudo mktemp` in `/var/tmp` so root owns it — see the workarounds table below and `docs/skills/composite-actions.md` → Known workarounds.
 - Mandatory cleanup flags (`--prune /sysroot/ --label ostree.commit- --label ostree.final-diffid-`) strip stale OSTree annotations and are hardcoded — they are correctness requirements, not tuning knobs.
 - `output-image` defaults to `source-image` (in-place rechunk).
 - `force-compression` input is optional and defaults to `false` (preserves existing compression). Use `true` for images that must migrate from existing registry compression (e.g. CentOS Stream bases transitioning from gzip to zstd:chunked).
@@ -261,6 +265,7 @@ Key design decisions:
 | `--skip-unused-stages=false` | buildah may skip the final import stage without this |
 | `-v "$(pwd):/run/src"` + `--security-opt=label=disable` | Required for buildah < v1.44 (Ubuntu 24.04 ships 1.33.x) — keeps the `/run/src` bind-mount alive so `out/` is findable by the final stage |
 | `sudo rm -rf out` | v0.6.0 Containerfile.splitter leaves `out/` dir in CWD; clean up to avoid stale files on re-runs |
+| `sudo mktemp` for the config temp file | `/var/tmp` is a world-writable sticky directory; `fs.protected_regular` rejects root's `O_CREAT` open of a runner-owned file there, so the file must be created root-owned before `sudo tee` writes it |
 | `sudo podman save "${OUTPUT_TAG}" \| podman load` | Copies image to user (rootless) storage as a convenience; rootful storage (from `sudo buildah build`) is still intact and is what `reusable-build.yml` downstream steps use |
 
 **Root storage prerequisite:** `source-image` must be visible to rootful container storage (i.e., built or imported with `sudo`/buildah). Images built rootless won't be found by `sudo buildah build --from`.
@@ -584,3 +589,50 @@ Consumer usage (call from any PR validation workflow):
   with:
     pr-title: ${{ github.event.pull_request.title }}
 ```
+
+---
+
+## When to Use
+
+Use this skill when:
+- Integrating or updating any specific action from the `bootc-build/` catalog in a consumer workflow.
+- Looking up specific inputs, outputs, defaults, or side effects of actions like `setup-runner`, `push-image`, `sign-and-publish`, or `chunka`.
+- Debugging execution quirks in a specific action (e.g. runner disk exhaustion, native overlay mounting, or SBOM size limits in `create-release`).
+- Extending or modifying the behavior or interface of an existing composite action.
+
+## When NOT to Use
+
+Do not use this skill to:
+- Learn broad authoring conventions or SHA-pinning guidelines (use parent `composite-actions.md`).
+- Implement top-level reusable workflows (use `reusable-workflow.md`).
+- Bypass consumer validation for changes to any of these actions (use `consumer-validation.md`).
+
+## Core Process
+
+1. **Locate target action**: Identify the action in `bootc-build/<name>/action.yml` and review its documentation section.
+2. **Review input/output contracts**: Check required vs optional inputs, default values, and outputs needed by downstream steps.
+3. **Verify caller environment**: Ensure prerequisites are met (e.g. `setup-runner` executed first, necessary permissions granted such as `packages: write` or `id-token: write`).
+4. **Wire and test**: Invoke the action via `@v1` (or relative/self-repo syntax within this repository).
+5. **Update docs on changes**: When inputs, outputs, or internal behaviors change, update this reference and `docs/consumer-contract.yml`.
+
+## Common Rationalizations
+
+| Rationalization | Reality |
+|---|---|
+| "The action worked in local testing without `setup-runner`." | GitHub runners lack necessary storage configuration (BTRFS/overlay) and updated Podman required for chunking and annotations. |
+| "I can omit `github-token` if GITHUB_TOKEN is available in caller environment." | Composite actions do not automatically inherit `secrets.GITHUB_TOKEN`; it must be explicitly passed. |
+| "A large release body is fine since GitHub allows extensive markdown." | GitHub releases hard-fail above 125,000 characters; `create-release` handles chunking/summarization to avoid failure. |
+
+## Red Flags
+
+- Missing `native-overlay: "true"` when running nested Podman-in-container builds that walk directories.
+- Calling `push-image` without verifying that image tags or digests were properly generated.
+- Hardcoding repository-specific identity regular expressions in `sign-and-publish` or `create-release`.
+- Skipping `scan-image` or ignoring CVE scan failures before publishing.
+
+## Verification
+
+- [ ] Target action inputs and outputs match caller workflow expectations.
+- [ ] Required runner prerequisites (tools, storage backend) are satisfied.
+- [ ] Caller provides sufficient permissions (`id-token: write`, `packages: write`, `contents: write` as needed).
+- [ ] `docs/consumer-contract.yml` remains consistent with any changed inputs/outputs.
