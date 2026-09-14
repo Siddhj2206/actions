@@ -444,6 +444,7 @@ Always add `workflow_dispatch` alongside `workflow_run` so the workflow can be t
 | `sudo podman save \| podman load` | `chunka` | buildah (root) and podman (user) use separate container stores |
 | `sudo buildah push --authfile ${RUNNER_TEMP}/push-auth.json` | `push-image` | `sudo podman push` cannot reach root container storage; `--authfile` bypasses `XDG_RUNTIME_DIR` inaccessible to sudo on Ubuntu 24.04 |
 | Largest-free tmpdir selection + `sudo mktemp -d -p <dir>` + `sudo chmod 755` for overlay dirs | `chunka` | BTRFS volume is root-owned; default `/var/tmp` is only ~1 GB on runners with BTRFS loopback; picks `/var/lib/containers` (~49 GB) when it has more free space; `sudo mktemp` needed because the dir is root-owned |
+| `sudo mktemp` for the chunkah config temp file (never a bare `mktemp`) | `chunka` | `/var/tmp` is a world-writable sticky directory (1777). A runner-owned file opened later by root (`sudo tee`) is rejected by `fs.protected_regular` (`may_create_in_sticky`, `fs/namei.c`): the caller owns neither the file nor the directory, and there is no root/CAP_FOWNER exemption. Create it as root so root owns it from the start |
 
 ### Reusable workflow caller permissions ceiling
 

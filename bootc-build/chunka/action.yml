@@ -62,7 +62,12 @@ runs:
         # CHUNKAH_CONFIG_STR passes existing OCI labels (containers.bootc=1, etc.)
         # into chunkah so they are preserved on the rechunked image.
         # Pass existing OCI labels into chunkah via a JSON file to avoid E2BIG on large base images (#462).
-        CHUNKAH_CONFIG_FILE="$(mktemp -p /var/tmp chunkah-config.XXXXXX.json)"
+        # Create the file as root: /var/tmp is a world-writable sticky directory (1777), and the
+        # kernel's fs.protected_regular check (may_create_in_sticky, fs/namei.c) refuses an O_CREAT
+        # open when the caller owns neither the file nor the directory. A runner-owned file opened
+        # by `sudo tee` (root) hits exactly that case and fails with EACCES. `sudo mktemp` makes root
+        # the owner so the later `sudo tee` is permitted.
+        CHUNKAH_CONFIG_FILE="$(sudo mktemp -p /var/tmp chunkah-config.XXXXXX.json)"
         sudo podman inspect "${SOURCE}" --format '{{json .Config}}' | sudo tee "${CHUNKAH_CONFIG_FILE}" > /dev/null
         sudo chmod 644 "${CHUNKAH_CONFIG_FILE}"
 

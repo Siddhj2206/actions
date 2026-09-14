@@ -248,7 +248,7 @@ incompatible with the composite action's current interface. See projectbluefin/d
 Key design decisions:
 - `CHUNKAH_VERSION`, `CHUNKAH_SHA`, and `bootc-build/chunka/Containerfile.splitter` are all version-pinned. **Bump all three together** when upgrading — see `docs/skills/supply-chain.md` for the step-by-step procedure.
 - `Containerfile.splitter` is vendored at `bootc-build/chunka/Containerfile.splitter` and referenced by local path (`${{ github.action_path }}/Containerfile.splitter`). It is **never fetched from the network at build time** — fetching from a mutable release URL is a supply-chain attack vector.
-- `CHUNKAH_CONFIG_STR=$(sudo podman inspect "${SOURCE}")` passes existing OCI labels through so `containers.bootc=1` and other metadata are preserved.
+- Existing OCI labels (`containers.bootc=1`, etc.) are passed to chunkah as a JSON file rather than on argv, to avoid E2BIG on large base images. The file is created with `sudo mktemp` in `/var/tmp` so root owns it — see the workarounds table below and `docs/skills/composite-actions.md` → Known workarounds.
 - Mandatory cleanup flags (`--prune /sysroot/ --label ostree.commit- --label ostree.final-diffid-`) strip stale OSTree annotations and are hardcoded — they are correctness requirements, not tuning knobs.
 - `output-image` defaults to `source-image` (in-place rechunk).
 - `force-compression` input is optional and defaults to `false` (preserves existing compression). Use `true` for images that must migrate from existing registry compression (e.g. CentOS Stream bases transitioning from gzip to zstd:chunked).
@@ -261,6 +261,7 @@ Key design decisions:
 | `--skip-unused-stages=false` | buildah may skip the final import stage without this |
 | `-v "$(pwd):/run/src"` + `--security-opt=label=disable` | Required for buildah < v1.44 (Ubuntu 24.04 ships 1.33.x) — keeps the `/run/src` bind-mount alive so `out/` is findable by the final stage |
 | `sudo rm -rf out` | v0.6.0 Containerfile.splitter leaves `out/` dir in CWD; clean up to avoid stale files on re-runs |
+| `sudo mktemp` for the config temp file | `/var/tmp` is a world-writable sticky directory; `fs.protected_regular` rejects root's `O_CREAT` open of a runner-owned file there, so the file must be created root-owned before `sudo tee` writes it |
 | `sudo podman save "${OUTPUT_TAG}" \| podman load` | Copies image to user (rootless) storage as a convenience; rootful storage (from `sudo buildah build`) is still intact and is what `reusable-build.yml` downstream steps use |
 
 **Root storage prerequisite:** `source-image` must be visible to rootful container storage (i.e., built or imported with `sudo`/buildah). Images built rootless won't be found by `sudo buildah build --from`.
